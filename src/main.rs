@@ -21,7 +21,13 @@ const SERVER_DOMAIN: &str = "jsonplaceholder.typicode.com";
 
 // Setting of the notary server — make sure these are the same with the config in ../../../notary/server
 const NOTARY_HOST: &str = "127.0.0.1";
+// const NOTARY_HOST: &str = "https://notary-au-1.verity.usher.so/";
 const NOTARY_PORT: u16 = 7047;
+
+// Maximum number of bytes that can be sent from prover to server
+const MAX_SENT_DATA: usize = 1 << 12;
+// Maximum number of bytes that can be received by prover from server
+const MAX_RECV_DATA: usize = 1 << 14;
 
 #[tokio::main]
 async fn main() {
@@ -47,7 +53,8 @@ async fn notarizer() -> String {
         .unwrap();
 
     // Send requests for configuration and notarization to the notary server.
-    let notarization_request = NotarizationRequest::builder().build().unwrap();
+    let notarization_request = NotarizationRequest::builder().max_sent_data(MAX_SENT_DATA)
+    .max_recv_data(MAX_RECV_DATA).build().unwrap();
 
     let Accepted {
         io: notary_connection,
@@ -62,6 +69,8 @@ async fn notarizer() -> String {
     let prover_config = ProverConfig::builder()
         .id(session_id)
         .server_dns(SERVER_DOMAIN)
+        .max_sent_data(MAX_SENT_DATA)
+        .max_recv_data(MAX_RECV_DATA)
         .build()
         .unwrap();
 
@@ -128,6 +137,8 @@ async fn notarizer() -> String {
     let parsed =
         serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&payload)).unwrap();
     println!("{}", serde_json::to_string_pretty(&parsed).unwrap());
+
+    // serde_json::to_string_pretty(&parsed).unwrap()
 
     // The Prover task should be done now, so we can grab it.
     let prover = prover_task.await.unwrap().unwrap();
@@ -205,4 +216,67 @@ async fn notarizer() -> String {
         .unwrap();
 
     serde_json::to_string_pretty(&parsed).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::Router;
+    use reqwest::Client; // Updated import
+    use tokio::task;
+    use tokio::sync::Semaphore;
+    use std::sync::Arc; // Add this import
+
+    #[tokio::test]
+    async fn load_test_proxy_endpoint() {
+        // Start the server in a background task
+        let server_task = tokio::spawn(async {
+            let app = Router::new().route("/proxy", get(notarizer));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:8080") // Use a different port for tests
+                .await
+                .expect("Failed to bind to address");
+            axum::serve(listener, app).await.expect("Failed to serve app");
+        });
+
+        // Give the server a moment to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        // Number of requests to simulate
+        let num_requests = 100;
+
+        // Create a reqwest client
+        let client = Client::new();
+
+        // Create a semaphore to limit concurrency
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4)); // Wrap semaphore in Arc
+
+        // Spawn tasks to send requests concurrently
+        let mut tasks = vec![];
+        for i in 0..num_requests {
+            let client = client.clone();
+            let semaphore = semaphore.clone(); // Clone the Arc
+            tasks.push(task::spawn(async move {
+                let permit = semaphore.acquire_owned().await.unwrap(); // Acquire permit
+                println!("Requesting : {}", i);
+                let response = client
+                    .get("http://127.0.0.1:8080/proxy")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let response_text = response.text().await.unwrap();
+                println!("Request complete : {} : {}", i, response_text);
+                drop(permit); // Release the permit
+            }));
+        }
+
+        // Wait for all tasks to complete
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        // Stop the server
+        server_task.abort();
+    }
 }
